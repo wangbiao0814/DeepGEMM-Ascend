@@ -2,7 +2,7 @@
 
 ## 910C + CANN 9.0.0：先运行独立 smoke test
 
-本仓库 README 的构建目标是 Ascend 950 + CANN 9.20，下面的 `run.py` 也针对该实现，不是 910C 的构建流程。只需运行设备已安装的 CANN GroupedMatmul 时，可在匹配的 PyTorch/torch_npu/CANN 环境中执行：
+本仓库 README 的构建目标是 Ascend 950 + CANN 9.20。`run.py` 默认仍使用该后端；在 910C 上要显式选择 `--operator-backend cann`，不需要编译或导入 DeepGEMM。先用以下脚本检查已安装的 PyTorch/torch_npu/CANN 环境：
 
 ```bash
 python experiments/grouped_weight_reload/run_910c.py --m 100 300 600 --k 512 --n 1024
@@ -11,6 +11,102 @@ python experiments/grouped_weight_reload/run_910c.py --m 100 300 600 --k 512 --n
 `run_910c.py` 只导入 torch 与 torch_npu，调用 `npu_grouped_matmul`，无需安装或编译本仓库；默认使用 BF16，并对每个专家的完整输出执行 CPU FP32 参考校验。输入按有效 token 紧密拼接，`group_list=[100,400,1000]`，不手动插入 256 行 padding。该接口支持情况与实际使用的 torch_npu/CANN 版本有关，须使用适配 CANN 9.0.0 的软件组合。
 
 这会调用 CANN 提供的另一份 GMM 实现，不能用来验证本仓库固定 BLOCK_M=256 的调度与加载量模型。本地仅检查了脚本语法与分组边界，尚未在 910C 上实测。参考 [torch_npu GMM 文档](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md)；C++ 调用可参考 CANN 的 `aclnnGroupedMatmulV5` 接口，CANN 9.0.0 已将旧版本接口标记为废弃。
+
+## 910C：比较负载不均与逐轮耗时方差
+
+先预览默认负载（不需要 torch/NPU）：
+
+```bash
+python experiments/grouped_weight_reload/run.py --operator-backend cann --dry-run
+```
+
+默认原始 token=64、top-k=8、专家=16，总 routed rows=512，自动生成三组：
+
+- `balanced`：每专家 32 行。
+- `skewed`：`[64,64,64,64,64,64,64,56,1,1,1,1,1,1,1,1]`。
+- `skewed_reversed`：将 skewed 的专家位置反转，负载大小的集合不变。
+
+三组的有效专家数、总行数、有效 FLOPs、权重大小相同。每专家行数不超过原始 token 数，符合一个 token 不重复选择同一专家的 top-k 计数约束。输入是人工构造的 `X_perm`；脚本不实际执行路由，也不构造每个原始 token 的重复副本，不运行 Attention、通信或激活。目的在于控制 GMM 的输入布局与负载分布。
+
+运行均衡/不均衡对照，并采集当前环境支持的管线、访存、资源冲突与 L2 指标：
+
+```bash
+python experiments/grouped_weight_reload/run.py \
+  --operator-backend cann --experts 16 --tokens 64 --topk 8 \
+  --n 2048 --k 2048 --iterations 100 \
+  --trace-metrics PipeUtilization Memory ResourceConflictRatio L2Cache \
+  --trace-iterations 20 --output results/cann_decode_small
+```
+
+要覆盖部分专家超过 256、部分不足 256 的分配，增加原始 token 数：
+
+```bash
+python experiments/grouped_weight_reload/run.py \
+  --operator-backend cann --experts 16 --tokens 512 --topk 8 \
+  --n 2048 --k 2048 --iterations 100 \
+  --trace-metrics PipeUtilization Memory ResourceConflictRatio \
+  --output results/cann_decode_large
+```
+
+此时 balanced 为每专家 256 行，skewed 同时有大、小专家。**256 只是我们选择的输入边界，不是已知的 CANN tile 大小**。CANN 的分块、驻留与尾块处理需看真实 kernel/tiling 和 profiler，脚本将 `actual_block_m`、`actual_output_tiles`、`model_weight_gm_to_l1_bytes` 留为 null。
+
+默认比较 warm 与 evict：warm 不主动清理缓存；evict 在每次调用前写入 2 倍设备报告 L2 容量的 buffer 并同步，flush 在计时区间外。它只尝试驱逐跨调用缓存，不保证完全驱逐，也不禁止本次 GMM 内部的复用。若 torch_npu 未报告 L2 容量，必须手动指定驱逐 buffer，或选择 `--cache warm`。例如，**仅在你确认 L2 为 192 MiB 时**可以指定 `--flush-mib 384`。
+
+### 自定义负载与固定重放
+
+`--case NAME:COUNT,...` 可以重复传入，每组必须有 `--experts` 个数，和为 `--tokens × --topk`，每个数在 `[0, tokens]`。显式 case 会替代默认三组。零 token 专家允许输入，但应核对当前 CANN 支持情况；各 case 激活专家数不相同时，不能视作相同权重工作集对照。
+
+例如总分配数均为 1024、同样激活 4 个专家：
+
+```bash
+python experiments/grouped_weight_reload/run.py \
+  --operator-backend cann --experts 4 --tokens 512 --topk 2 \
+  --case balanced:256,256,256,256 \
+  --case skewed:512,256,128,128 \
+  --iterations 100 --output results/cann_custom
+```
+
+只保留一个 case 就是固定输入/权重/分组重放，可排除轮间路由变化：
+
+```bash
+python experiments/grouped_weight_reload/run.py \
+  --operator-backend cann --experts 4 --tokens 512 --topk 2 \
+  --case replay:512,256,128,128 --cache warm \
+  --iterations 100 --trace-metrics PipeUtilization ResourceConflictRatio \
+  --output results/cann_replay
+```
+
+`--m` 仍是原 DeepGEMM 的均匀 M 扫描参数，不能在 CANN 路径使用。`--backend persistent/fast/slow` 也是原 DeepGEMM profiler 参数，CANN 使用独立 torch_npu profiler。
+
+### 输出与判读
+
+- `metadata.json`：所有 case 的计数/紧密 PSUM、字节数、设备/软件版本、输入/权重地址和抽样正确性结果。
+- `samples.csv`：每个 case 每轮的 `operator_event_us`、`host_call_us`、输出地址和调用顺序。默认每轮随机打乱 case 顺序，种子固定；`--order fixed` 则按 case 列表顺序轮流调用。两个选项都没有 Attention/通信重叠，每次调用完成后同步。
+- `results.csv`：各 case/cache 条件的均值、标准差、CV、p50/p95、最小/最大值。**operator_event_us 是 NPU event 包围一次调用的时间窗口，不是纯 kernel/MTE2 时间**；它可能包含 host 发射期间的设备空档。
+- `trace_status.json`：每个独立 PMU pass 的成功/失败状态；不支持的指标会警告并记录错误，保留已完成的计时，不填成 0。
+- `traces/<case>/<cache>/<metric>/`：原始 profiler 导出，`collection.json` 记录 case 和调用数；CPU trace 标记每个调用为 `gmm/<case>/<cache>/<metric>/call_N`。
+- 同目录 `matched_rows.jsonl`：按 `--kernel-pattern` 匹配的 CSV 原始行，保留原字段名/单位、文件名和行号；不会擅自将 per-core 行相加、推断单次 load 延迟或转换缺失指标。`export_manifest.json` 列出导出 CSV。没有匹配行时检查原始 CSV/数据库与实际 kernel 名，必要时修改 regex。
+
+同一次运行中所有 case 共用相同的输入和权重存储。输出由 torch_npu 每次调用分配，脚本不假设存在固定输出 buffer API，记录地址便于检查；host 调用时间也独立保存。每个 case 都先执行并抽查每专家首尾最多 8 个有效行，对比 CPU FP32，随后预热。计时与 PMU 分开采集，PMU pass 不可直接对应为 samples.csv 中某条慢样本，也不能用另一遍的耗时换算带宽。
+
+建议先看以下证据，不自动宣布某个原因成立：
+
+| 现象 | 下一步核对 |
+|---|---|
+| 固定 replay 仍波动 | 外部竞争、设备状态、host 发射开销、逐核表现；不能再归因于路由变化 |
+| 负载对照的算子窗口时间不同 | 查实际 kernel/tiling、真实搬运量和 PMU；相同有效 FLOPs 不保证实际工作量相同 |
+| MTE2 执行时间相近，但整体时间变长 | 查同步与下游管线；并非直接证明 L1 buffer 等待 |
+| MTE2/队列等待相关计数增加 | 结合具体字段定义与 MTE1/Cube/Fixpipe 指标分析，队列拥塞不等于 L1 等待 |
+| 同样流量但活跃带宽下降 | 查并发竞争、访存分布及测量口径 |
+| 原始指标缺失或不受支持 | 本次采集不足以验证该假设，使用匹配 CANN 9.0.0 的 msopprof 工具进一步分析 |
+
+各 CANN/芯片支持的指标不完全相同，不能用其他版本的字段定义代替当前导出。参考 [Profiler 配置说明](https://www.hiascend.com/document/detail/zh/Pytorch/700/apiref/apilist/ptaoplist_001391.html)。脚本没有修改设备 kernel，也没有直接测出单条 GM→L1 指令或 L1 buffer 等待时长。
+
+CPU-only 验证：
+
+```bash
+python -B -m unittest discover -s experiments/grouped_weight_reload -p test_experiment.py -v
+```
 
 ## Ascend 950 源码实验
 

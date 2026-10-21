@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""BF16 grouped GEMM weight reload experiment; --dry-run needs only Python."""
+"""BF16 grouped GEMM experiment: DeepGEMM (950) or installed CANN (910C).
+
+--dry-run needs only Python. Use --operator-backend cann on 910C.
+"""
 
 import argparse
 import csv
@@ -161,25 +164,60 @@ def run(args, cases):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--experts', type=int, default=4)
-    parser.add_argument('--m', type=int, nargs='+', default=[64, 255, 256, 257, 512, 513, 1024])
+    parser.add_argument('--operator-backend', choices=['deepgemm', 'cann'], default='deepgemm')
+    parser.add_argument('--experts', type=int, default=None)
+    parser.add_argument('--m', type=int, nargs='+', default=None, help='DeepGEMM: per-expert M scan')
     parser.add_argument('--n', type=int, default=2048)
     parser.add_argument('--k', type=int, default=2048)
     parser.add_argument('--cache', choices=['warm', 'evict', 'both'], default='both')
     parser.add_argument('--warmups', type=int, default=10)
     parser.add_argument('--iterations', type=int, default=30)
-    parser.add_argument('--backend', choices=['persistent', 'fast', 'slow'], default='persistent')
-    parser.add_argument('--trace-metrics', nargs='+', choices=['MemoryAccess', 'L2Cache', 'PipeUtilization'])
+    parser.add_argument('--backend', choices=['persistent', 'fast', 'slow'], default='persistent',
+                        help='DeepGEMM only: profiler backend')
+    parser.add_argument('--trace-metrics', nargs='+', choices=[
+        'MemoryAccess', 'Memory', 'L2Cache', 'PipeUtilization', 'ResourceConflictRatio'])
     parser.add_argument('--trace-iterations', type=int, default=5)
     parser.add_argument('--seed', type=int, default=1234)
     parser.add_argument('--device', default='npu:0')
     parser.add_argument('--output', type=Path, default=Path('results/grouped_weight_reload'))
     parser.add_argument('--dry-run', action='store_true')
+    parser.add_argument('--tokens', type=int, default=64, help='CANN: original token count')
+    parser.add_argument('--topk', type=int, default=8, help='CANN: experts selected per token')
+    parser.add_argument('--case', action='append', default=[], metavar='NAME:COUNTS',
+                        help='CANN: repeatable case, e.g. balanced:128,128,128,128')
+    parser.add_argument('--order', choices=['fixed', 'shuffle'], default='shuffle',
+                        help='CANN: case order within each timing round')
+    parser.add_argument('--flush-mib', type=float, default=None,
+                        help='CANN: explicit eviction buffer MiB if L2 capacity is unavailable')
+    parser.add_argument('--kernel-pattern', default=r'grouped.*(?:matmul|gemm)',
+                        help='CANN: case-insensitive regex for exported profiler rows')
     args = parser.parse_args()
-    if min(args.experts, args.n, args.k, *args.m, args.warmups, args.iterations, args.trace_iterations) <= 0:
+    if args.experts is None:
+        args.experts = 16 if args.operator_backend == 'cann' else 4
+    if min(args.experts, args.n, args.k, *(args.m or []), args.warmups, args.iterations, args.trace_iterations) <= 0:
         parser.error('dimensions, warmups and iteration counts must be positive')
     if args.n % 64 or args.k % 64:
         parser.error('This experiment requires N and K to be multiples of 64 to avoid sector/tail effects')
+    if args.operator_backend == 'cann':
+        if args.m is not None:
+            parser.error('CANN uses --tokens/--topk and --case; --m is the DeepGEMM-only scan')
+        from cann_experiment import build_cases, run_cann
+        try:
+            cases = build_cases(args)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.dry_run:
+            print(json.dumps(cases, indent=2))
+            return
+        try:
+            run_cann(args, cases)
+        except ImportError as exc:
+            raise SystemExit(f'CANN runtime import failed: {exc}. No DeepGEMM build is required.') from exc
+        return
+    if args.case:
+        parser.error('--case is currently supported only with --operator-backend cann')
+    if args.m is None:
+        args.m = [64, 255, 256, 257, 512, 513, 1024]
     args.m = sorted(set(args.m))
     cases = [describe_case(args.experts, m, args.n, args.k) for m in args.m]
     if args.dry_run:
