@@ -1,5 +1,19 @@
 # MoE GroupedMatmul 专家权重重复加载实验
 
+## 910C + CANN 9.0.0：先运行独立 smoke test
+
+本仓库 README 的构建目标是 Ascend 950 + CANN 9.20，下面的 `run.py` 也针对该实现，不是 910C 的构建流程。只需运行设备已安装的 CANN GroupedMatmul 时，可在匹配的 PyTorch/torch_npu/CANN 环境中执行：
+
+```bash
+python experiments/grouped_weight_reload/run_910c.py --m 100 300 600 --k 512 --n 1024
+```
+
+`run_910c.py` 只导入 torch 与 torch_npu，调用 `npu_grouped_matmul`，无需安装或编译本仓库；默认使用 BF16，并对每个专家的完整输出执行 CPU FP32 参考校验。输入按有效 token 紧密拼接，`group_list=[100,400,1000]`，不手动插入 256 行 padding。该接口支持情况与实际使用的 torch_npu/CANN 版本有关，须使用适配 CANN 9.0.0 的软件组合。
+
+这会调用 CANN 提供的另一份 GMM 实现，不能用来验证本仓库固定 BLOCK_M=256 的调度与加载量模型。本地仅检查了脚本语法与分组边界，尚未在 910C 上实测。参考 [torch_npu GMM 文档](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md)；C++ 调用可参考 CANN 的 `aclnnGroupedMatmulV5` 接口，CANN 9.0.0 已将旧版本接口标记为废弃。
+
+## Ascend 950 源码实验
+
 这个实验针对本仓库的 **BF16 M-grouped GEMM**，区分两件事：
 
 1. 同一权重是否为不同 M tile 重复发起 GM→L1 搬运：由执行路径和分块数量推导。
