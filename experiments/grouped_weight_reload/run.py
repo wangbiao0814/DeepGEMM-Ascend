@@ -182,7 +182,9 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('results/grouped_weight_reload'))
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--tokens', type=int, default=64, help='CANN: original token count')
-    parser.add_argument('--topk', type=int, default=8, help='CANN: experts selected per token')
+    parser.add_argument('--topk', type=int, default=None, help='CANN: experts selected per token (default 8)')
+    parser.add_argument('--single-expert-m', type=int, nargs='+', default=None,
+                        help='CANN: scan one expert with different M, sharing weight/input backing storage')
     parser.add_argument('--case', action='append', default=[], metavar='NAME:COUNTS',
                         help='CANN: repeatable case, e.g. balanced:128,128,128,128')
     parser.add_argument('--order', choices=['fixed', 'shuffle'], default='shuffle',
@@ -193,7 +195,9 @@ def main():
                         help='CANN: case-insensitive regex for exported profiler rows')
     args = parser.parse_args()
     if args.experts is None:
-        args.experts = 16 if args.operator_backend == 'cann' else 4
+        args.experts = 1 if args.single_expert_m else 16 if args.operator_backend == 'cann' else 4
+    if args.topk is None:
+        args.topk = 1 if args.single_expert_m else 8
     if min(args.experts, args.n, args.k, *(args.m or []), args.warmups, args.iterations, args.trace_iterations) <= 0:
         parser.error('dimensions, warmups and iteration counts must be positive')
     if args.n % 64 or args.k % 64:
@@ -216,6 +220,8 @@ def main():
         return
     if args.case:
         parser.error('--case is currently supported only with --operator-backend cann')
+    if args.single_expert_m:
+        parser.error('--single-expert-m requires --operator-backend cann')
     if args.m is None:
         args.m = [64, 255, 256, 257, 512, 513, 1024]
     args.m = sorted(set(args.m))

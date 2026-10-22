@@ -108,6 +108,46 @@ CPU-only 验证：
 python -B -m unittest discover -s experiments/grouped_weight_reload -p test_experiment.py -v
 ```
 
+## 单专家：观察 M 增大时的权重重读证据
+
+`--single-expert-m` 在**同一个进程**中扫描不同 M，自动选择 experts=1、topk=1，不与 `--case` 同用。所有 case 共用一份权重和最大输入的前 M 行视图，权重大小/地址、输入基地址保持一致；与负载对照不同，这个实验有意改变有效总行数。`--tokens` 不参与该扫描的计数生成。
+
+先比较 100 与 600，权重取 K=7168、N=4096 的 BF16 矩阵，大小恰好 56 MiB：
+
+```bash
+python experiments/grouped_weight_reload/run.py \
+  --operator-backend cann --single-expert-m 100 600 \
+  --k 7168 --n 4096 --cache warm --iterations 100 \
+  --trace-metrics PipeUtilization L2Cache Memory MemoryAccess \
+  --kernel-pattern 'matmul|gemm' \
+  --trace-iterations 20 --output results/one_expert_reload_probe
+```
+
+只有 PipeUtilization 不能判断 HBM 重读。L2Cache/Memory/MemoryAccess 是否支持、能否给出有效字节数，取决于设备与 torch_npu/CANN 版本；检查 `trace_status.json` 和原始导出，失败或缺失不视为 0。
+
+如果 100/600 都没有明显差异，可以扩大扫描至 `--single-expert-m 100 600 2048 8192 16384`。以假设的 192 MiB L2 为例，56 MiB 权重配合 600 行输入/输出的唯一数据量约 69 MiB，不一定产生容量压力；16384 行时输入本身约 224 MiB，更适合探索压力下的行为。**唯一数据量超过 L2 仍不保证权重一定被淘汰并重读**，这还依赖访问顺序、替换策略与后续复用。当前代码不预设 CANN 的 M tile 大小，扩大 M 也可能改变 kernel/tiling。
+
+为排除跨调用热缓存，另跑一次 `--cache evict`，指定新输出目录。设备能报告 L2 时自动用 2 倍容量的 buffer；否则使用你确认过的容量设置 `--flush-mib`。驱逐发生在调用之前，不能用它证明调用内部发生了淘汰，也不能与“禁用 L2”混为一谈。冷启动第一次加载是基线，不能统计成权重重读。
+
+### 证据分别支持什么
+
+| 需要验证的环节 | 可以观察的证据 | 不能单独当证据的现象 |
+|---|---|---|
+| 多个 M tile 重复请求权重 | 实际 tiling/反汇编确认同权重地址被多任务读取；或可归因的权重搬运字节数 | MTE2 时间增长、假定 BLOCK_M=256 |
+| L2 复用变差 | L2 读命中/缺失与请求量随 M 变化 | 只有全算子的低命中率：首次输入读取也会 miss |
+| HBM 重读 | 同次采集中确认的 HBM/GM 实际读字节数，排除输入重复读取及 workspace 后的权重读取放大 | 读带宽增长、总读量超过单份权重大小 |
+| 因输入挤出权重而重读 | 在固定 tiling 下只改变 A/output 的缓存分配策略，B 策略不变，看到权重侧 miss/重读随之改变 | 同时改变 M、kernel、权重大小或关闭全部 L2 |
+
+总读取量包含 A、B 和可能的内部 workspace，不能直接用 `(HBM_bytes - unique_input_bytes) / weight_bytes` 宣称权重重读倍数，因为 A 也可能沿 N tile 被重复读取。保留每次调用、每核和总量的不同统计口径；不要把 L2 命中百分比相加，也不要把另一遍计时乘到本遍带宽上。
+
+### torch_npu 导出不够时
+
+可进一步使用与本机 CANN 9.0.0 配套的 `msprof op`，先检查 `msprof op --help`。官方工具的 MemoryDetail 提供 GM 数据传输量与缓存相关视图，并支持 A3；具体功能/命令以本机版本为准。先从已有导出获取真实 kernel 名，再按该名字筛选，避免把启动时的数据拷贝当成 GMM。**单专家时不能假定底层 kernel 名一定含 GroupedMatmul**。
+
+不要在 `msprof op` 外部采集时同时传入本脚本的 `--trace-metrics`，以免嵌套 profiler。也要核对 replay 模式：官方文档说明 kernel/range replay 会清 L2，application replay 不主动清 L2；它们得到的缓存初始条件不能混比。参考 [msOpProf 指南](https://github.com/Ascend/msopprof/blob/master/docs/en/user_guide/msopprof_user_guide.md)。如果匹配版本的工具没有可归因的权重数据，结果应表述为“支持/不支持重读假设”，不能宣称完整证明淘汰因果链。
+
+本地只运行了 Python-only 检查，没有在 910C 上实际采集。特别是旧版工具可能不提供指令级地址轨迹；不要将新版 950 专用指令流水功能假定为 910C 可用。
+
 ## Ascend 950 源码实验
 
 这个实验针对本仓库的 **BF16 M-grouped GEMM**，区分两件事：

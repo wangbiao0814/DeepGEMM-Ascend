@@ -48,6 +48,21 @@ class WorkloadTests(unittest.TestCase):
         self.assertLess(min(cases[1]['counts']), 256)
         self.assertIsNone(cases[1]['actual_output_tiles'])
 
+    def test_single_expert_scan_shares_weight_size_not_input_size(self):
+        cases = build_cases(arguments(experts=1, topk=1, single_expert_m=[600, 100, 600],
+                                      n=4096, k=7168))
+        self.assertEqual([case['counts'] for case in cases], [[100], [600]])
+        self.assertEqual([case['group_list'] for case in cases], [[100], [600]])
+        self.assertEqual(cases[0]['active_weight_bytes'], 56 * 1024 * 1024)
+        self.assertEqual(cases[0]['active_weight_bytes'], cases[1]['active_weight_bytes'])
+        self.assertEqual(cases[1]['input_bytes'], 6 * cases[0]['input_bytes'])
+        for updates in [dict(experts=2), dict(topk=2), dict(case=['a:100']),
+                        dict(single_expert_m=[0, 100])]:
+            values = dict(experts=1, topk=1, single_expert_m=[100, 600])
+            values.update(updates)
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                build_cases(arguments(**values))
+
     def test_custom_zero_group_and_tight_prefix_sum(self):
         case = build_cases(arguments(experts=3, tokens=500, topk=2,
                                     case=['abc:100,400,500']))[0]
@@ -89,6 +104,10 @@ class WorkloadTests(unittest.TestCase):
         old = subprocess.run([sys.executable, str(script), '--dry-run', '--m', '257'],
                              capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(old.stdout)[0]['m_tiles_per_expert'], 2)
+        scan = subprocess.run([sys.executable, str(script), '--operator-backend', 'cann',
+                               '--single-expert-m', '100', '600', '--dry-run'],
+                              capture_output=True, text=True, check=True)
+        self.assertEqual([case['counts'] for case in json.loads(scan.stdout)], [[100], [600]])
         invalid = subprocess.run([sys.executable, str(script), '--operator-backend', 'cann',
                                   '--dry-run', '--m', '257'], capture_output=True, text=True)
         self.assertEqual(invalid.returncode, 2)

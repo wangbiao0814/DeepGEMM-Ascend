@@ -46,6 +46,13 @@ def build_cases(args):
         re.compile(args.kernel_pattern, re.IGNORECASE)
     except re.error as exc:
         raise ValueError(f'Invalid --kernel-pattern: {exc}') from exc
+    scan = getattr(args, 'single_expert_m', None)
+    if scan:
+        if experts != 1 or topk != 1 or args.case:
+            raise ValueError('--single-expert-m requires experts=1, topk=1 and no --case')
+        if min(scan) <= 0:
+            raise ValueError('--single-expert-m values must be positive')
+        return [describe_counts(f'm{m}', [m], args.n, args.k) for m in sorted(set(scan))]
     total = tokens * topk
     named = []
     if args.case:
@@ -237,7 +244,9 @@ def run_cann(args, cases):
             'host_call_us': 'Host API call including output allocation/dispatch; excludes synchronize.',
             'counter_passes': 'Separate profiler invocations; no automatic per-sample PMU correlation.',
         },
-        controls='Same X and weight storage across all cases, same routed rows/N/K. '
+        controls='Same weight and input backing storage across all cases, same N/K. '
+                 'Single-expert M scan uses prefixes of the maximum-size input; routed rows vary. '
+                 'Load-balance suite keeps routed rows fixed. '
                  'Output is allocated by torch_npu per call; no fixed-output API is assumed. '
                  'Synthetic X_perm; routing, attention and communication are not executed.',
     )
@@ -263,12 +272,13 @@ def run_cann(args, cases):
                 writer.writerows(summary_rows)
 
     # CANN consumes tightly concatenated input; no assumed 256-row alignment.
-    x_cpu = torch.randn(cases[0]['routed_rows'], args.k, dtype=torch.bfloat16)
+    x_cpu = torch.randn(max(case['routed_rows'] for case in cases), args.k, dtype=torch.bfloat16)
     w_cpu = torch.randn(args.experts, args.k, args.n, dtype=torch.bfloat16)
     x = x_cpu.to(args.device)
     weight = w_cpu.to(args.device)
     layouts = [torch.tensor(case['group_list'], dtype=torch.int64, device=args.device) for case in cases]
-    calls = [make_call(torch_npu, x, weight, layout) for layout in layouts]
+    calls = [make_call(torch_npu, x[:case['routed_rows']], weight, layout)
+             for case, layout in zip(cases, layouts)]
     outputs = [None] * len(cases)
     diffs = []
     flush = torch.empty(flush_bytes, dtype=torch.uint8, device=args.device) if flush_bytes else None
